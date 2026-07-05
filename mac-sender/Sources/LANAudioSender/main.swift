@@ -1,4 +1,22 @@
 import Foundation
+import AVFoundation
+
+/// Requests microphone/input access and blocks until the user responds. Capturing
+/// from any input device (including BlackHole) requires this permission on macOS.
+func ensureMicrophoneAccess() -> Bool {
+    switch AVCaptureDevice.authorizationStatus(for: .audio) {
+    case .authorized:
+        return true
+    case .notDetermined:
+        let sem = DispatchSemaphore(value: 0)
+        var granted = false
+        AVCaptureDevice.requestAccess(for: .audio) { granted = $0; sem.signal() }
+        sem.wait()
+        return granted
+    default:
+        return false
+    }
+}
 
 // MARK: - CLI
 
@@ -34,6 +52,18 @@ print("  target      : \(cfg.receiverHost):\(cfg.audioPort) (audio), :\(cfg.cont
 print("  input device: \(cfg.inputDevice)")
 print("  format      : \(cfg.sampleRate) Hz, \(cfg.channels) ch, \(cfg.frameMs) ms frames, codec=\(cfg.codec)")
 print("")
+
+guard ensureMicrophoneAccess() else {
+    FileHandle.standardError.write(Data("""
+    ERROR: Microphone access was denied.
+    Capturing from BlackHole needs microphone permission. Open
+    System Settings → Privacy & Security → Microphone, enable your terminal
+    (Terminal/iTerm), then run this again. If it never appeared, run:
+        tccutil reset Microphone
+    and restart the sender to re-trigger the prompt.\n
+    """.utf8))
+    exit(1)
+}
 
 let codec = makeCodec(cfg.codec)
 

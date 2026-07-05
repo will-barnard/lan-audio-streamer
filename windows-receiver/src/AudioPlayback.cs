@@ -4,13 +4,12 @@ using NAudio.Wave;
 namespace LANAudioReceiver;
 
 /// <summary>Renders received PCM into a chosen WASAPI render device (VB-CABLE).
-/// The <see cref="JitterWaveProvider"/> feeds a resampler matched to the device's
-/// shared mix format, so it works regardless of the device's native format.</summary>
+/// Uses <see cref="AdaptivePlayback"/>, which outputs float at the device's mix
+/// format and rate-matches the sender, so no separate resampler is needed.</summary>
 public sealed class AudioPlayback : IDisposable
 {
     private readonly WasapiOut _output;
-    private readonly MediaFoundationResampler _resampler;
-    public JitterWaveProvider Jitter { get; }
+    private readonly AdaptivePlayback _provider;
 
     public AudioPlayback(string deviceName, int sampleRate, int channels, int jitterMs)
     {
@@ -18,21 +17,21 @@ public sealed class AudioPlayback : IDisposable
             ?? throw new InvalidOperationException(
                 $"Render device not found: \"{deviceName}\". Run with --list-devices.");
 
-        Jitter = new JitterWaveProvider(sampleRate, channels, jitterMs);
+        var mix = device.AudioClient.MixFormat;
+        _provider = new AdaptivePlayback(sampleRate, channels, mix.SampleRate, mix.Channels, jitterMs);
 
-        // Convert our 16-bit PCM to the device's shared mix format (usually float).
-        var mixFormat = device.AudioClient.MixFormat;
-        _resampler = new MediaFoundationResampler(Jitter, mixFormat) { ResamplerQuality = 60 };
-
-        // Event-sync shared mode, ~50 ms device buffer.
-        _output = new WasapiOut(device, AudioClientShareMode.Shared, true, 50);
-        _output.Init(_resampler);
+        // Low-latency shared-mode output (~20 ms device buffer), event-driven.
+        _output = new WasapiOut(device, AudioClientShareMode.Shared, true, 20);
+        _output.Init(_provider); // ISampleProvider overload (float samples)
     }
 
     public void Start() => _output.Play();
 
-    public float Peak => Jitter.LastPeak;
-    public int Depth => Jitter.Depth;
+    public void Push(uint seq, byte[] pcm, int frameSamples, int channels) =>
+        _provider.Push(seq, pcm, frameSamples, channels);
+
+    public float Peak => _provider.LastPeak;
+    public int DepthMs => _provider.DepthMs;
 
     public static MMDevice? FindRenderDevice(string name)
     {
@@ -41,7 +40,6 @@ public sealed class AudioPlayback : IDisposable
         foreach (var d in devices)
             if (string.Equals(d.FriendlyName, name, StringComparison.OrdinalIgnoreCase))
                 return d;
-        // Fall back to a substring match (e.g. "CABLE Input" vs full friendly name).
         foreach (var d in devices)
             if (d.FriendlyName.Contains(name, StringComparison.OrdinalIgnoreCase))
                 return d;
@@ -55,9 +53,5 @@ public sealed class AudioPlayback : IDisposable
             yield return d.FriendlyName;
     }
 
-    public void Dispose()
-    {
-        _output.Dispose();
-        _resampler.Dispose();
-    }
+    public void Dispose() => _output.Dispose();
 }

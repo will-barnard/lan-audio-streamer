@@ -59,7 +59,10 @@ final class AudioCapture {
             throw CaptureError.converterFailed
         }
 
-        input.installTap(onBus: 0, bufferSize: 2048, format: inFormat) { [weak self] buffer, _ in
+        // Small tap buffer (~10 ms) so audio is sent in smooth, frequent chunks
+        // rather than large ~40 ms bursts — this lets the receiver run a much
+        // shallower (lower-latency) jitter buffer without underrunning.
+        input.installTap(onBus: 0, bufferSize: 480, format: inFormat) { [weak self] buffer, _ in
             self?.process(buffer, with: converter, inputSampleRate: inFormat.sampleRate)
         }
         engine.prepare()

@@ -7,7 +7,18 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "LANAudioSender",
-            path: "Sources/LANAudioSender"
+            path: "Sources/LANAudioSender",
+            // Embed an Info.plist into the CLI binary so macOS knows the microphone
+            // usage description and will show the permission prompt (required to
+            // capture from any input device, including BlackHole).
+            linkerSettings: [
+                .unsafeFlags([
+                    "-Xlinker", "-sectcreate",
+                    "-Xlinker", "__TEXT",
+                    "-Xlinker", "__info_plist",
+                    "-Xlinker", "Resources/Info.plist"
+                ])
+            ]
         )
     ]
 )

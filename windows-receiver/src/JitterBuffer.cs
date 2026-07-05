@@ -3,152 +3,186 @@ using NAudio.Wave;
 namespace LANAudioReceiver;
 
 /// <summary>
-/// An <see cref="IWaveProvider"/> that reorders incoming PCM frames by sequence
-/// number, absorbs network jitter with a target buffer depth, conceals lost
-/// packets with silence, and bounds latency against clock drift by dropping when
-/// the buffer grows too deep.
+/// Playback provider with an integrated jitter buffer and an adaptive resampler.
 ///
-/// WASAPI pulls from <see cref="Read"/> on its own real-time thread; the network
-/// thread calls <see cref="Push"/>. Access is locked.
+/// Incoming PCM frames are reordered by sequence into a flat float FIFO. The
+/// playback side (pulled by WASAPI on its real-time thread) reads that FIFO with a
+/// linear-interpolation resampler whose rate is continuously nudged — by a fraction
+/// of a percent — to hold the buffer at a small target depth. This cancels the
+/// clock-rate difference between the Mac's capture clock and the PC's render clock,
+/// so latency stays low and constant without underruns.
+///
+/// Output is float at the device's mix format so it feeds WASAPI shared mode
+/// directly (no separate resampler).
 /// </summary>
-public sealed class JitterWaveProvider : IWaveProvider
+public sealed class AdaptivePlayback : ISampleProvider
 {
     private readonly object _lock = new();
-    private readonly SortedDictionary<uint, byte[]> _frames = new();
-    private readonly int _jitterMs;
-    private readonly int _sampleRate;
-    private readonly int _channels;
 
-    private uint _playhead;
+    private readonly int _srcRate;
+    private readonly int _srcChannels;
+    private readonly int _dstChannels;
+    private readonly double _baseStep;   // srcRate / dstRate
+
+    // Reorder buffer
+    private readonly SortedDictionary<uint, float[]> _pending = new();
+    private uint _expectedSeq;
+    private bool _seqInit;
+    private const int MaxReorder = 8;
+
+    // Flat interleaved (source channels) circular FIFO
+    private readonly float[] _ring;
+    private readonly int _capacity;
+    private int _head;
+    private int _count;
+
+    // Resampler + drift-control state
+    private double _frac;
+    private double _drift = 1.0;
     private bool _started;
-    private int _targetFrames = 3;
-    private int _frameBytes;
-    private byte[] _residual = Array.Empty<byte>();
-    private int _residualPos;
+    private readonly int _targetFrames;
 
     public WaveFormat WaveFormat { get; }
-
-    /// <summary>Peak (0..1) of the most recently received frame, for the meter.</summary>
     public float LastPeak { get; private set; }
 
-    /// <summary>Frames currently buffered (for status display).</summary>
-    public int Depth { get { lock (_lock) return _frames.Count; } }
+    /// <summary>Current buffered audio in milliseconds (for status display).</summary>
+    public int DepthMs { get { lock (_lock) return (int)(_count / (double)_srcChannels * 1000.0 / _srcRate); } }
 
-    public JitterWaveProvider(int sampleRate, int channels, int jitterMs)
+    public AdaptivePlayback(int srcRate, int srcChannels, int dstRate, int dstChannels, int jitterMs)
     {
-        _sampleRate = sampleRate;
-        _channels = channels;
-        _jitterMs = jitterMs;
-        WaveFormat = new WaveFormat(sampleRate, 16, channels);
+        _srcRate = srcRate;
+        _srcChannels = srcChannels;
+        _dstChannels = dstChannels;
+        _baseStep = (double)srcRate / dstRate;
+        _targetFrames = Math.Max(1, jitterMs * srcRate / 1000);
+        _capacity = Math.Max(srcRate * srcChannels, _targetFrames * srcChannels * 8); // ≥ ~1 s
+        _ring = new float[_capacity];
+        WaveFormat = WaveFormat.CreateIeeeFloatWaveFormat(dstRate, dstChannels);
     }
 
-    public void Push(uint seq, byte[] pcm, int frameSamples)
+    // ---------------- Network side ----------------
+
+    public void Push(uint seq, byte[] pcmS16, int frameSamples, int channels)
     {
+        int n = pcmS16.Length / 2;
+        var f = new float[n];
+        float peak = 0;
+        for (int i = 0, j = 0; j < n; i += 2, j++)
+        {
+            short s = (short)(pcmS16[i] | (pcmS16[i + 1] << 8));
+            float v = s / 32768f;
+            f[j] = v;
+            float a = v < 0 ? -v : v;
+            if (a > peak) peak = a;
+        }
+
         lock (_lock)
         {
-            _frameBytes = pcm.Length;
-            if (frameSamples > 0)
-            {
-                double frameMs = frameSamples * 1000.0 / _sampleRate;
-                _targetFrames = Math.Max(1, (int)Math.Ceiling(_jitterMs / frameMs));
-            }
-
-            // Ignore packets for slots we've already played past.
-            if (_started && seq < _playhead) return;
-
-            _frames[seq] = pcm;
-            UpdatePeak(pcm);
-
-            // Overrun guard: bound latency against clock drift.
-            int maxFrames = _targetFrames * 3;
-            if (_frames.Count > maxFrames)
-            {
-                // Jump the playhead forward, dropping the oldest frames.
-                uint newest = 0;
-                foreach (var k in _frames.Keys) newest = k;
-                uint target = newest > (uint)_targetFrames ? newest - (uint)_targetFrames : 0;
-                var stale = _frames.Keys.Where(k => k < target).ToList();
-                foreach (var k in stale) _frames.Remove(k);
-                _playhead = target;
-                _residual = Array.Empty<byte>();
-                _residualPos = 0;
-            }
+            LastPeak = Math.Max(peak, LastPeak * 0.8f);
+            if (!_seqInit) { _expectedSeq = seq; _seqInit = true; }
+            if (seq < _expectedSeq) return;      // late or duplicate
+            _pending[seq] = f;
+            Drain();
         }
     }
 
-    public int Read(byte[] buffer, int offset, int count)
+    private void Drain()
     {
-        int written = 0;
+        while (true)
+        {
+            if (_pending.TryGetValue(_expectedSeq, out var frame))
+            {
+                _pending.Remove(_expectedSeq);
+                Enqueue(frame);
+                _expectedSeq++;
+            }
+            else if (_pending.Count > MaxReorder)
+            {
+                // The expected packet is presumed lost: insert one silent frame of
+                // the same length to preserve timing, then continue.
+                int len = 0;
+                foreach (var kv in _pending) { len = kv.Value.Length; break; }
+                if (len > 0) Enqueue(new float[len]);
+                _expectedSeq++;
+            }
+            else break;
+        }
+    }
+
+    private void Enqueue(float[] samples)
+    {
+        if (_count + samples.Length > _capacity)
+        {
+            int drop = (_count + samples.Length) - _capacity; // drop oldest
+            _head = (_head + drop) % _capacity;
+            _count -= drop;
+        }
+        int tail = (_head + _count) % _capacity;
+        for (int i = 0; i < samples.Length; i++)
+        {
+            _ring[tail] = samples[i];
+            tail = tail + 1 == _capacity ? 0 : tail + 1;
+        }
+        _count += samples.Length;
+    }
+
+    // ---------------- Playback side ----------------
+
+    public int Read(float[] buffer, int offset, int count)
+    {
+        int outFrames = count / _dstChannels;
         lock (_lock)
         {
-            while (written < count)
+            if (!_started)
             {
-                // Serve leftover bytes from the current frame first.
-                if (_residualPos < _residual.Length)
+                if (_count >= _targetFrames * _srcChannels) _started = true;
+                else { Array.Clear(buffer, offset, count); return count; }
+            }
+
+            UpdateDrift();
+            double step = _baseStep * _drift;
+
+            for (int produced = 0; produced < outFrames; produced++)
+            {
+                if (_count < 2 * _srcChannels)
                 {
-                    int n = Math.Min(count - written, _residual.Length - _residualPos);
-                    Array.Copy(_residual, _residualPos, buffer, offset + written, n);
-                    _residualPos += n;
-                    written += n;
-                    continue;
+                    // Underrun: silence the rest and re-prebuffer.
+                    int rem = (outFrames - produced) * _dstChannels;
+                    Array.Clear(buffer, offset + produced * _dstChannels, rem);
+                    _started = false;
+                    return count;
                 }
 
-                // Prebuffer: wait until we have the target depth before starting.
-                if (!_started)
+                int baseIdx = _head;
+                int nextIdx = (_head + _srcChannels) % _capacity;
+                int outBase = offset + produced * _dstChannels;
+                for (int c = 0; c < _dstChannels; c++)
                 {
-                    if (_frames.Count >= _targetFrames)
-                    {
-                        _started = true;
-                        foreach (var k in _frames.Keys) { _playhead = k; break; } // smallest key
-                    }
-                    else
-                    {
-                        return FillSilence(buffer, offset + written, count - written) + written;
-                    }
+                    int sc = c < _srcChannels ? c : _srcChannels - 1; // duplicate if fewer src channels
+                    float a = _ring[(baseIdx + sc) % _capacity];
+                    float b = _ring[(nextIdx + sc) % _capacity];
+                    buffer[outBase + c] = (float)(a + (b - a) * _frac);
                 }
 
-                // Fetch the next frame in order.
-                if (_frames.TryGetValue(_playhead, out var frame))
+                _frac += step;
+                while (_frac >= 1.0 && _count >= 2 * _srcChannels)
                 {
-                    _frames.Remove(_playhead);
-                    _playhead++;
-                    _residual = frame;
-                    _residualPos = 0;
-                }
-                else if (_frames.Count > 0)
-                {
-                    // A packet is missing but later ones arrived: conceal with one
-                    // frame of silence and move on (packet loss concealment).
-                    _playhead++;
-                    _residual = new byte[Math.Max(_frameBytes, 2)];
-                    _residualPos = 0;
-                }
-                else
-                {
-                    // Underrun: nothing buffered. Emit silence without advancing so
-                    // we resume cleanly when packets arrive.
-                    return FillSilence(buffer, offset + written, count - written) + written;
+                    _head = (_head + _srcChannels) % _capacity;
+                    _count -= _srcChannels;
+                    _frac -= 1.0;
                 }
             }
         }
-        return written;
-    }
-
-    private static int FillSilence(byte[] buffer, int offset, int count)
-    {
-        Array.Clear(buffer, offset, count);
         return count;
     }
 
-    private void UpdatePeak(byte[] pcm)
+    /// <summary>Nudge playback rate toward keeping the buffer at the target depth.
+    /// Correction is capped at ±1% (inaudible) and slewed for smoothness.</summary>
+    private void UpdateDrift()
     {
-        float peak = 0;
-        for (int i = 0; i + 1 < pcm.Length; i += 2)
-        {
-            short s = (short)(pcm[i] | (pcm[i + 1] << 8));
-            float a = Math.Abs(s / 32768f);
-            if (a > peak) peak = a;
-        }
-        LastPeak = Math.Max(peak, LastPeak * 0.7f);
+        double fill = _count / (double)_srcChannels;
+        double error = (fill - _targetFrames) / _targetFrames;
+        double target = 1.0 + Math.Clamp(error * 0.5, -0.01, 0.01);
+        _drift += (target - _drift) * 0.05;
     }
 }

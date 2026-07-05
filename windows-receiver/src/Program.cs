@@ -62,7 +62,7 @@ _ = Task.Run(() =>
     {
         string status = receiver.IsConnected ? "CONNECTED" : "waiting… ";
         string peer = string.IsNullOrEmpty(receiver.PeerName) ? "" : $"from {receiver.PeerName}";
-        Console.Write($"\r{status} {peer,-16} buf {playback.Depth,2}  {Meter.Bar(playback.Peak)}   ");
+        Console.Write($"\r{status} {peer,-16} buf {playback.DepthMs,3}ms  {Meter.Bar(playback.Peak)}   ");
         Thread.Sleep(250);
     }
 });

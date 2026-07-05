@@ -64,7 +64,7 @@ public sealed class Receiver : IDisposable
             Array.Copy(d, Protocol.AudioHeaderSize, payload, 0, payloadLen);
 
             var pcm = _codec.Decode(payload, frameSamples, channels);
-            _playback.Jitter.Push(seq, pcm, frameSamples);
+            _playback.Push(seq, pcm, frameSamples, channels);
             LastAudioUtc = DateTime.UtcNow;
         }
     }
