@@ -7,6 +7,8 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <AssemblyName>LANAudioReceiver</AssemblyName>
     <RootNamespace>LANAudioReceiver</RootNamespace>
+    <!-- Run on the newest installed .NET runtime if 8.0 isn't present (e.g. .NET 10). -->
+    <RollForward>LatestMajor</RollForward>
     <!-- Windows-only (WASAPI + Media Foundation via NAudio). Build/run on Windows. -->
   </PropertyGroup>
 
