@@ -1,0 +1,16 @@
+# Environment / secrets
+.env
+
+# macOS sender (SwiftPM)
+mac-sender/.build/
+mac-sender/.swiftpm/
+mac-sender/*.xcodeproj
+.DS_Store
+
+# Windows receiver (.NET)
+windows-receiver/bin/
+windows-receiver/obj/
+
+# Editors
+.vscode/
+.idea/
